@@ -1,9 +1,11 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { Wallet } from '@project-serum/anchor';
-import { AddressLookupTableAccount, clusterApiUrl, Connection, Keypair, PublicKey, sendAndConfirmTransaction, Transaction, TransactionInstruction, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
+import { AddressLookupTableAccount, clusterApiUrl, ComputeBudgetProgram, Connection, Keypair, PublicKey, sendAndConfirmTransaction, Transaction, TransactionExpiredBlockheightExceededError, TransactionInstruction, TransactionMessage, VersionedTransaction, VersionedTransactionResponse } from '@solana/web3.js';
 import axios from 'axios';
 import * as bs58 from 'bs58';
 import fetch from 'cross-fetch';
+import promiseRetry from "promise-retry";
+import { retry } from 'rxjs';
 
 @Injectable()
 export class AppService implements OnModuleInit {
@@ -12,13 +14,15 @@ export class AppService implements OnModuleInit {
   usdtDecimals = 6
   peopleAddress = 'CobcsUrt3p91FwvULYKorQejgsm5HoQdv5T8RUZ6PnLA'
   peopleDecimals = 8
-  
+
   connection = new Connection(clusterApiUrl("mainnet-beta"), { commitment: "confirmed" });
   wallet = new Wallet(Keypair.fromSecretKey(bs58.decode('')));
   walletPayFee = new Wallet(Keypair.fromSecretKey(bs58.decode('')));
+  wait = (time: number) =>
+    new Promise((resolve) => setTimeout(resolve, time));
 
   async onModuleInit() {
-    await this.swapWithPayer()
+    await this.swapWithoutPayer()
   }
 
   async swapWithPayer() {
@@ -29,6 +33,8 @@ export class AppService implements OnModuleInit {
     if (instructions.error) {
       throw new Error("Failed to get swap instructions: " + instructions.error);
     }
+
+    console.log('instructions:', instructions)
 
     const {
       tokenLedgerInstruction, // If you are using `useTokenLedger = true`.
@@ -79,12 +85,13 @@ export class AppService implements OnModuleInit {
       ...(await getAddressLookupTableAccounts(addressLookupTableAddresses))
     );
 
-    const blockhash = (await this.connection.getLatestBlockhash()).blockhash;
+    const blockhash = (await this.connection.getLatestBlockhash('confirmed')).blockhash;
     const messageV0 = new TransactionMessage({
       payerKey: this.walletPayFee.publicKey,
       recentBlockhash: blockhash,
       instructions: [
         deserializeInstruction(swapInstructionPayload),
+        ComputeBudgetProgram.setComputeUnitLimit({ units: 300000 })
       ],
     }).compileToV0Message(addressLookupTableAccounts);
     const transaction = new VersionedTransaction(messageV0);
@@ -93,16 +100,16 @@ export class AppService implements OnModuleInit {
     transaction.sign([this.wallet.payer, this.walletPayFee.payer]);
 
     // Simulate the transaction to check for errors
-    // try {
-    //   const simulationResult = await this.connection.simulateTransaction(transaction);
-    //   if (simulationResult.value.err) {
-    //     console.error('Transaction simulation failed:', simulationResult.value);
-    //     return;
-    //   }
-    // } catch (error) {
-    //   console.error('Transaction simulation error:', error);
-    //   return;
-    // }
+    try {
+      const simulationResult = await this.connection.simulateTransaction(transaction);
+      if (simulationResult.value.err) {
+        console.error('Transaction simulation failed:', simulationResult.value);
+        return;
+      }
+    } catch (error) {
+      console.error('Transaction simulation error:', error);
+      return;
+    }
 
     // Execute the transaction
     const rawTransaction = transaction.serialize()
@@ -136,27 +143,17 @@ export class AppService implements OnModuleInit {
     // sign the transaction
     transaction.sign([this.wallet.payer]);
 
-    // Simulate the transaction to check for errors
-    try {
-      const simulationResult = await this.connection.simulateTransaction(transaction);
-      if (simulationResult.value.err) {
-        console.error('Transaction simulation failed:', simulationResult.value);
-        return;
-      }
-    } catch (error) {
-      console.error('Transaction simulation error:', error);
-      return;
-    }
-
     // Execute the transaction
     const rawTransaction = transaction.serialize()
     const txid = await this.connection.sendRawTransaction(rawTransaction, {
-      skipPreflight: false,
+      skipPreflight: true,
       maxRetries: 2
     });
     console.log('txid:', txid)
+
     const lastestBlock = await this.connection.getLatestBlockhash()
     console.log('blockhash', lastestBlock.blockhash)
+
     const result = await this.connection.confirmTransaction({
       lastValidBlockHeight: lastestBlock.lastValidBlockHeight,
       blockhash: lastestBlock.blockhash,
@@ -164,6 +161,97 @@ export class AppService implements OnModuleInit {
     });
     console.log('result:', result)
   }
+
+  // async transactionSenderAndConfirmationWaiter({
+  //   connection,
+  //   serializedTransaction,
+  //   blockhashWithExpiryBlockHeight,
+  // }): Promise<VersionedTransactionResponse | null> {
+  //   const txid = await connection.sendRawTransaction(
+  //     serializedTransaction,
+  //     {
+  //       skipPreflight: true,
+  //     }
+  //   );
+
+  //   const controller = new AbortController();
+  //   const abortSignal = controller.signal;
+
+  //   const abortableResender = async () => {
+  //     while (true) {
+  //       await this.wait(2_000);
+  //       if (abortSignal.aborted) return;
+  //       try {
+  //         await connection.sendRawTransaction(
+  //           serializedTransaction,
+  //           {
+  //             skipPreflight: true,
+  //           }
+  //         );
+  //       } catch (e) {
+  //         console.warn(`Failed to resend transaction: ${e}`);
+  //       }
+  //     }
+  //   };
+
+  //   try {
+  //     abortableResender();
+  //     const lastValidBlockHeight =
+  //       blockhashWithExpiryBlockHeight.lastValidBlockHeight - 150;
+
+  //     // this would throw TransactionExpiredBlockheightExceededError
+  //     await Promise.race([
+  //       connection.confirmTransaction(
+  //         {
+  //           ...blockhashWithExpiryBlockHeight,
+  //           // lastValidBlockHeight,
+  //           signature: txid,
+  //           abortSignal,
+  //         },
+  //         "confirmed"
+  //       ),
+  //       new Promise(async (resolve) => {
+  //         // in case ws socket died
+  //         while (!abortSignal.aborted) {
+  //           await this.wait(2_000);
+  //           const tx = await connection.getSignatureStatus(txid, {
+  //             searchTransactionHistory: false,
+  //           });
+  //           if (tx?.value?.confirmationStatus === "confirmed") {
+  //             resolve(tx);
+  //           }
+  //         }
+  //       }),
+  //     ]);
+  //   } catch (e) {
+  //     if (e instanceof TransactionExpiredBlockheightExceededError) {
+  //       // we consume this error and getTransaction would return null
+  //       console.log('0--------------')
+  //       return null;
+  //     } else {
+  //       // invalid state from web3.js
+  //       throw e;
+  //     }
+  //   } finally {
+  //     controller.abort();
+  //   }
+
+  //   // in case rpc is not synced yet, we add some retries
+  //   const response = await promiseRetry(async (retry) => {
+  //     const response = await connection.getTransaction(txid, {
+  //       commitment: "confirmed",
+  //       maxSupportedTransactionVersion: 0,
+  //     });
+  //     if (!response) {
+  //       retry(response);
+  //     }
+  //     console.log('txId: ', txid)
+  //     return response;
+  //   }, {retries: 5, minTimeout: 1e3})
+
+  //   console.log('txId-2: ', txid)
+  //   return response;
+  // }
 
   async getRouteForSwap(inputMint, outputMint, amount, slippageBps = 50) {
 
@@ -193,7 +281,7 @@ export class AppService implements OnModuleInit {
           // feeAccount is optional. Use if you want to charge a fee.  feeBps must have been passed in /quote API.
           // feeAccount,
           dynamicComputeUnitLimit: true,
-          prioritizationFeeLamports: 'auto'
+          prioritizationFeeLamports: 2000000
         })
       })
     ).json();
@@ -213,7 +301,7 @@ export class AppService implements OnModuleInit {
           quoteResponse,
           userPublicKey: this.wallet.publicKey.toString(),
           // auto wrap and unwrap SOL. default is true
-          // wrapAndUnwrapSol: true,
+          wrapAndUnwrapSol: true,
           dynamicComputeUnitLimit: true,
           prioritizationFeeLamports: 'auto',
         })
